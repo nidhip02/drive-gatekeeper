@@ -11,7 +11,11 @@ import { z } from "zod";
 import { getAuthClient } from "./google-auth.js";
 import { isBlocked, loadBlockedIds } from "./blocklist.js";
 import { logAccess } from "./access-log.js";
-import { APPROVAL_TOKEN, handleApprovalsHttp, requestApproval, type Decision, type Operation } from "./approvals.js";
+import {
+  APPROVAL_TOKEN, handleApprovalsHttp, handlePhoneDecision, requestApproval,
+  type Decision, type Operation, type Outcome,
+} from "./approvals.js";
+import { notifyConfig } from "./notify.js";
 
 const PORT = 8787; // MCP endpoint — this is what the tunnel exposes to the internet
 const APPROVALS_PORT = 8788; // approvals page — only reachable from this Mac, never through the tunnel
@@ -35,7 +39,7 @@ function text(message: string, isError = false) {
 async function askUser(
   extra: { signal: AbortSignal; _meta?: { progressToken?: string | number | undefined } | undefined; sendNotification: (n: any) => Promise<void> },
   request: { operation: Operation; tool: string; fileName?: string | undefined; fileId?: string | undefined; query?: string | undefined },
-): Promise<Decision> {
+): Promise<Outcome> {
   const progressToken = extra._meta?.progressToken;
   let tick = 0;
   const ping = progressToken === undefined ? undefined : setInterval(() => {
@@ -55,6 +59,13 @@ const DECLINED: Record<Exclude<Decision, "approved">, string> = {
   timeout: "The user did not approve this request in time.",
 };
 
+// A plain-English reason for the log.
+function why(o: Outcome): string {
+  if (o.via === "timeout") return "no answer in time";
+  if (o.via === "cancelled") return "request cancelled";
+  return `user ${o.decision === "approved" ? "approved" : "denied"} on ${o.via}`;
+}
+
 // Same reply whether a file is blocked or doesn't exist, so Claude can't tell them apart.
 const NOT_AVAILABLE = "This file is not available.";
 
@@ -70,10 +81,10 @@ function buildServer(): McpServer {
       annotations: { readOnlyHint: true },
     },
     async ({ query }, extra) => {
-      const decision = await askUser(extra, { operation: "list", tool: "search_files", query });
-      if (decision !== "approved") {
-        logAccess({ tool: "search_files", operation: "list", decision: "denied", query, detail: `user ${decision}` });
-        return text(DECLINED[decision], true);
+      const outcome = await askUser(extra, { operation: "list", tool: "search_files", query });
+      if (outcome.decision !== "approved") {
+        logAccess({ tool: "search_files", operation: "list", decision: "denied", query, detail: why(outcome) });
+        return text(DECLINED[outcome.decision], true);
       }
       try {
         const safe = query.replace(/\\/g, "\\\\").replace(/'/g, "\\'");
@@ -90,7 +101,7 @@ function buildServer(): McpServer {
           if (file.id && !(await isBlocked(drive, file.id, blocked, cache).catch(() => true))) visible.push(file);
           else hidden++;
         }
-        logAccess({ tool: "search_files", operation: "list", decision: "allowed", query,
+        logAccess({ tool: "search_files", operation: "list", decision: "allowed", query, approvedVia: outcome.via,
           detail: `returned ${visible.length}, hid ${hidden} blocked` });
         if (visible.length === 0) return text("No matching files found.");
         return text(visible.map((f) => `- ${f.name} (id: ${f.id}, type: ${f.mimeType}, modified: ${f.modifiedTime})`).join("\n"));
@@ -124,11 +135,11 @@ function buildServer(): McpServer {
         const meta = await drive.files.get({ fileId, fields: "id, name, mimeType" });
         const { name, mimeType } = meta.data;
 
-        const decision = await askUser(extra, { operation: "read", tool: "read_file", fileName: name ?? fileId, fileId });
-        if (decision !== "approved") {
+        const outcome = await askUser(extra, { operation: "read", tool: "read_file", fileName: name ?? fileId, fileId });
+        if (outcome.decision !== "approved") {
           logAccess({ tool: "read_file", operation: "read", decision: "denied", fileId, fileName: name ?? undefined,
-            detail: `user ${decision}` });
-          return text(DECLINED[decision], true);
+            detail: why(outcome) });
+          return text(DECLINED[outcome.decision], true);
         }
 
         let content: string;
@@ -152,7 +163,7 @@ function buildServer(): McpServer {
 
         const truncated = content.length > MAX_CHARS;
         logAccess({ tool: "read_file", operation: "read", decision: "allowed", fileId, fileName: name ?? undefined,
-          detail: `${content.length} chars${truncated ? " (truncated)" : ""}` });
+          approvedVia: outcome.via, detail: `${content.length} chars${truncated ? " (truncated)" : ""}` });
         return text(`# ${name}\n\n${content.slice(0, MAX_CHARS)}${truncated ? "\n\n[...truncated]" : ""}`);
       } catch (err) {
         logAccess({ tool: "read_file", operation: "read", decision: "error", fileId, detail: (err as Error).message });
@@ -167,6 +178,7 @@ function buildServer(): McpServer {
 // A fresh server per request ("stateless" mode) keeps things simple.
 const mcpHttpServer = createServer(async (req, res) => {
   const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
+  if (handlePhoneDecision(req, res, url)) return; // the phone's Allow/Deny buttons (one-time keys)
   if (url.pathname !== MCP_PATH) {
     res.writeHead(404).end("Not found"); // wrong or missing secret: reveal nothing
     return;
@@ -196,6 +208,14 @@ mcpHttpServer.listen(PORT, "127.0.0.1", () => {
     ? `Claude connector URL: ${publicUrl}${MCP_PATH}`
     : `Claude connector URL: https://<your-ngrok-domain>${MCP_PATH}  (add PUBLIC_URL to .env to print it in full)`);
   console.log("Keep both URLs private — they work like a password.");
+  if (notifyConfig.enabled) {
+    console.log(`\n📱 Phone alerts: subscribe to topic "${notifyConfig.topic}" in the ntfy app.`);
+    console.log(notifyConfig.publicUrl
+      ? "   Allow/Deny buttons on the notification: ON"
+      : "   Allow/Deny buttons: OFF (add PUBLIC_URL to .env to turn them on)");
+  } else {
+    console.log("\n📱 Phone alerts: OFF (NTFY_DISABLED=1)");
+  }
 });
 
 approvalsHttpServer.listen(APPROVALS_PORT, "127.0.0.1", () => {
