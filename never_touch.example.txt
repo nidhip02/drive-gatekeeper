@@ -1,0 +1,4 @@
+# One Drive link or file/folder ID per line. Anything after # is a note.
+# Blocking a folder blocks everything inside it.
+https://docs.google.com/document/d/REPLACE_WITH_FILE_ID/edit   # example document
+REPLACE_WITH_FOLDER_ID   # example folder
